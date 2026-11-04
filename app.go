@@ -44,6 +44,8 @@ type App struct {
 	config            Config
 	manager           platform.PlatformManager // process-level (multi-window)
 	platWindow        platform.PlatformWindow  // primary window (per-window ops)
+	startedWindow     platform.PlatformWindow  // primary window HostLoop.Start created; kept for Stop after a close clears platWindow
+	hostLoopStarted   bool                     // a HostLoop owns the loop, so Run refuses
 	renderer          *Renderer
 	primaryPlatformID platform.WindowID
 
@@ -89,6 +91,10 @@ type App struct {
 	// Lazy-initialized on first PollInputEvent call. Events are collected
 	// during classifyEvent dispatch and drained each frame.
 	inputEvents []gpucontext.InputEvent
+
+	// Reused by every pump, so draining events allocates no slices.
+	pumpedEvents     []platform.Event
+	secondaryResizes []platform.Event
 
 	// Resource tracker for automatic GPU resource cleanup on shutdown.
 	tracker *resourceTracker
@@ -366,6 +372,9 @@ var _ ResourceTracker = (*App)(nil)
 // This ensures the window never shows "Not Responding" during heavy
 // GPU operations like swapchain recreation (vkDeviceWaitIdle).
 func (a *App) Run() error {
+	if a.hostLoopStarted {
+		return ErrHostLoopStarted
+	}
 	// Lock main goroutine to OS main thread.
 	// Required for Win32/Cocoa window operations.
 	runtime.LockOSThread()
@@ -744,7 +753,7 @@ func (a *App) processEventsMultiThread() {
 	// Collect all events first, then process.
 	// This allows us to coalesce resize events.
 	var lastResize *platform.Event
-	var events []platform.Event
+	events := a.pumpedEvents[:0]
 
 	for {
 		event := a.manager.PollEvents()
@@ -753,12 +762,14 @@ func (a *App) processEventsMultiThread() {
 		}
 		events = append(events, event)
 	}
+	a.pumpedEvents = events
 
 	// Classify events by type and window.
-	var secondaryResizes []platform.Event
+	secondaryResizes := a.secondaryResizes[:0]
 	for i := range events {
 		lastResize, secondaryResizes = a.classifyEvent(&events[i], lastResize, secondaryResizes)
 	}
+	a.secondaryResizes = secondaryResizes
 
 	// Queue primary window resize for render thread (deferred pattern).
 	// RequestResize is an atomic coalesced store so rapid live-resize events
