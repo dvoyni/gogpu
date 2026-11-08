@@ -2,6 +2,9 @@ package gogpu
 
 import (
 	"errors"
+	"fmt"
+	"image"
+	"log/slog"
 	"os"
 	"runtime"
 	"strings"
@@ -248,8 +251,8 @@ func TestHostLoop_NewWindowOpensHidden(t *testing.T) {
 	if platformWindow.visible || window.Visible() {
 		t.Error("NewWindow showed the window")
 	}
-	if _, ok := loop.BeginFrame(window); ok {
-		t.Error("BeginFrame before Show: got ok=true, want false")
+	if _, ok, err := loop.BeginFrame(window); ok || err != nil {
+		t.Errorf("BeginFrame before Show: got ok=%v, error %v; want false, nil", ok, err)
 	}
 	window.Show()
 	if !platformWindow.visible || !window.Visible() {
@@ -312,16 +315,18 @@ func TestHostLoop_SeveralWindowsEachDrawAFrame(t *testing.T) {
 		t.Errorf("WindowCount: got %d, want 3", count)
 	}
 	for i, window := range windows {
-		context, ok := loop.BeginFrame(window)
+		context, ok, err := loop.BeginFrame(window)
 		if !ok {
-			t.Fatalf("BeginFrame on window %d: got ok=false", i)
+			t.Fatalf("BeginFrame on window %d: got ok=false, error %v", i, err)
 		}
 		wantWidth, wantHeight := window.PhysicalSize()
 		if width, height := context.FramebufferSize(); width != wantWidth || height != wantHeight {
 			t.Errorf("window %d framebuffer: got %dx%d, want %dx%d", i, width, height, wantWidth, wantHeight)
 		}
 		context.Clear(0.1, 0.2, 0.3, 1)
-		loop.EndFrame(context)
+		if err := loop.EndFrame(context); err != nil {
+			t.Errorf("EndFrame on window %d: %v", i, err)
+		}
 	}
 }
 
@@ -388,14 +393,95 @@ func TestHostLoop_BeginFrameAcquires(t *testing.T) {
 	_, loop, window := startedHostLoop(t, &mockWindow{width: 800, height: 600})
 	defer loop.Stop()
 
-	context, ok := loop.BeginFrame(window)
-	if !ok {
-		t.Fatal("BeginFrame on a shown window: got ok=false, want true")
+	context, ok, err := loop.BeginFrame(window)
+	if !ok || err != nil {
+		t.Fatalf("BeginFrame on a shown window: got ok=%v, error %v; want true, nil", ok, err)
 	}
 	if width, height := context.FramebufferSize(); width != 800 || height != 600 {
 		t.Errorf("framebuffer: got %dx%d, want 800x600", width, height)
 	}
-	loop.EndFrame(context)
+	if err := loop.EndFrame(context); err != nil {
+		t.Errorf("EndFrame: %v", err)
+	}
+}
+
+// frameErrors are errors a driver answers at acquire or present: those wgpu
+// types, the device's loss wrapped as a backend wraps it, and one wgpu does
+// not type.
+var frameErrors = []error{
+	wgpu.ErrSurfaceOutdated,
+	wgpu.ErrSurfaceLost,
+	wgpu.ErrTimeout,
+	fmt.Errorf("vulkan: %w", wgpu.ErrDeviceLost),
+	errors.New("driver: no frame"),
+}
+
+// failedAcquires makes every acquire for the rest of the test fail with err,
+// acquiring nothing.
+func failedAcquires(t *testing.T, err error) {
+	t.Helper()
+	acquire := acquireSurfaceTextureFn
+	acquireSurfaceTextureFn = func(*wgpu.Surface) (*wgpu.SurfaceTexture, bool, error) { return nil, false, err }
+	t.Cleanup(func() { acquireSurfaceTextureFn = acquire })
+}
+
+// failedPresents makes every present for the rest of the test answer err
+// once the frame went to the surface, as a driver answers a frame it took.
+func failedPresents(t *testing.T, err error) {
+	t.Helper()
+	present := presentSurfaceTextureFn
+	presentSurfaceTextureFn = func(surface *wgpu.Surface, texture *wgpu.SurfaceTexture, damage []image.Rectangle) error {
+		if presentErr := present(surface, texture, damage); presentErr != nil {
+			return presentErr
+		}
+		return err
+	}
+	t.Cleanup(func() { presentSurfaceTextureFn = present })
+}
+
+func TestHostLoop_BeginFrameAnswersTheAcquireError(t *testing.T) {
+	for _, acquireErr := range frameErrors {
+		t.Run(acquireErr.Error(), func(t *testing.T) {
+			_, loop, window := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+			defer loop.Stop()
+			failedAcquires(t, acquireErr)
+			records := errorRecords(t)
+
+			context, ok, err := loop.BeginFrame(window)
+			if ok || context != nil {
+				t.Fatal("BeginFrame with a failed acquire: got ok=true, want false")
+			}
+			if !errors.Is(err, acquireErr) {
+				t.Errorf("BeginFrame with a failed acquire: got error %v, want %v", err, acquireErr)
+			}
+			if records.Len() != 0 {
+				t.Errorf("BeginFrame logged the error it answered: %s", records.String())
+			}
+		})
+	}
+}
+
+func TestHostLoop_EndFrameAnswersThePresentError(t *testing.T) {
+	for _, presentErr := range frameErrors {
+		t.Run(presentErr.Error(), func(t *testing.T) {
+			_, loop, window := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+			defer loop.Stop()
+			failedPresents(t, presentErr)
+			records := errorRecords(t)
+
+			context, ok, err := loop.BeginFrame(window)
+			if !ok {
+				t.Fatalf("BeginFrame: got ok=false, error %v", err)
+			}
+			context.Clear(0.1, 0.2, 0.3, 1)
+			if err := loop.EndFrame(context); !errors.Is(err, presentErr) {
+				t.Errorf("EndFrame with a failed present: got error %v, want %v", err, presentErr)
+			}
+			if records.Len() != 0 {
+				t.Errorf("EndFrame logged the error it answered: %s", records.String())
+			}
+		})
+	}
 }
 
 func TestHostLoop_BeginFrameSkipsHiddenWindow(t *testing.T) {
@@ -404,8 +490,8 @@ func TestHostLoop_BeginFrameSkipsHiddenWindow(t *testing.T) {
 	defer loop.Stop()
 
 	window.Hide()
-	if _, ok := loop.BeginFrame(window); ok {
-		t.Error("BeginFrame on a hidden window: got ok=true, want false")
+	if _, ok, err := loop.BeginFrame(window); ok || err != nil {
+		t.Errorf("BeginFrame on a hidden window: got ok=%v, error %v; want false, nil", ok, err)
 	}
 	if app.renderer.GetFrameStats().PresentSkipped {
 		t.Error("BeginFrame on a hidden window attempted an acquire")
@@ -417,8 +503,8 @@ func TestHostLoop_BeginFrameSkipsZeroSizeWindow(t *testing.T) {
 	app, loop, window := startedHostLoop(t, &mockWindow{width: 0, height: 0})
 	defer loop.Stop()
 
-	if _, ok := loop.BeginFrame(window); ok {
-		t.Error("BeginFrame on a zero-size window: got ok=true, want false")
+	if _, ok, err := loop.BeginFrame(window); ok || err != nil {
+		t.Errorf("BeginFrame on a zero-size window: got ok=%v, error %v; want false, nil", ok, err)
 	}
 	if app.renderer.GetFrameStats().PresentSkipped {
 		t.Error("BeginFrame on a zero-size window attempted an acquire")
@@ -430,8 +516,8 @@ func TestHostLoop_BeginFrameSkipsClosedFrameGate(t *testing.T) {
 	app, loop, window := startedHostLoop(t, &mockFrameGaterWindow{mockWindow: mockWindow{width: 800, height: 600}, ready: false})
 	defer loop.Stop()
 
-	if _, ok := loop.BeginFrame(window); ok {
-		t.Error("BeginFrame with the frame gate closed: got ok=true, want false")
+	if _, ok, err := loop.BeginFrame(window); ok || err != nil {
+		t.Errorf("BeginFrame with the frame gate closed: got ok=%v, error %v; want false, nil", ok, err)
 	}
 	if app.renderer.GetFrameStats().PresentSkipped {
 		t.Error("BeginFrame with the frame gate closed attempted an acquire")
@@ -574,5 +660,45 @@ func TestRunFrame_OnUpdateSeesEachInputEdgeOnce(t *testing.T) {
 
 	if len(justPressed) != 2 || !justPressed[0] || justPressed[1] {
 		t.Errorf("JustPressed(KeyA) in onUpdate over two frames: got %v, want [true false]", justPressed)
+	}
+}
+
+// Run's loop has no caller to give a frame's error to, so it logs it: an
+// outdated surface at debug level, any other at error level.
+func TestRunFrame_LogsTheFrameErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		fail  func(*testing.T, error)
+		err   error
+		level slog.Level
+	}{
+		{"acquire outdated", failedAcquires, wgpu.ErrSurfaceOutdated, slog.LevelDebug},
+		{"acquire lost", failedAcquires, wgpu.ErrSurfaceLost, slog.LevelError},
+		{"present outdated", failedPresents, wgpu.ErrSurfaceOutdated, slog.LevelDebug},
+		{"present device lost", failedPresents, fmt.Errorf("vulkan: %w", wgpu.ErrDeviceLost), slog.LevelError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app, loop, window := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+			defer loop.Stop()
+			test.fail(t, test.err)
+			records := recordsFrom(t, slog.LevelDebug)
+
+			app.renderFrameGPU([]windowFrame{{
+				window: window,
+				onDraw: func(context *Context) { context.Clear(0.1, 0.2, 0.3, 1) },
+				scale:  1,
+				physW:  800,
+				physH:  600,
+			}})
+
+			logged := false
+			for _, record := range strings.Split(records.String(), "\n") {
+				logged = logged || strings.Contains(record, "level="+test.level.String()) && strings.Contains(record, test.err.Error())
+			}
+			if !logged {
+				t.Errorf("Run's frame did not log %q at %v; logged:\n%s", test.err, test.level, records.String())
+			}
+		})
 	}
 }
