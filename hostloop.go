@@ -58,9 +58,8 @@ func NewHostLoop(app *App) *HostLoop {
 // cannot start, it returns the error and destroys what it had created. While
 // a HostLoop is started, Run and a second Start return ErrHostLoopStarted.
 //
-// The app's Config chooses the graphics API, the power preference and the
-// required features; its window fields are not used, since Start opens no
-// window.
+// The app's Config chooses the graphics API and the power preference; its
+// window fields are not used, since Start opens no window.
 func (loop *HostLoop) Start() error {
 	a := loop.app
 	if a.hostLoopStarted {
@@ -71,7 +70,7 @@ func (loop *HostLoop) Start() error {
 	}
 	// No modal tick: nothing may call into the frame path from inside PumpEvents.
 	a.renderLoop = &inlineRenderLoop{}
-	renderer, err := newWindowlessRendererFn(a.config.GraphicsAPI, a.config.PowerPreference, a.config.RequiredFeatures)
+	renderer, err := newWindowlessRendererFn(a.config.GraphicsAPI, deviceRequestFrom(&a.config))
 	if err != nil {
 		a.manager.Destroy()
 		return err
