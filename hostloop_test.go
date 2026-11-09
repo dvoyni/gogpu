@@ -54,12 +54,17 @@ func (m *queuedEventManager) PollEvents() platform.Event {
 func (m *queuedEventManager) rewind() { m.nextEvent = 0 }
 
 // startedHostLoopWithNoWindow starts a HostLoop on the software backend over a
-// platform that hands out windows, in order, to NewWindow.
+// platform that hands out windows, in order, to NewWindow, and requests its
+// device.
 func startedHostLoopWithNoWindow(t *testing.T, windows []platform.PlatformWindow, events ...platform.Event) (*App, *HostLoop, *queuedEventManager) {
 	t.Helper()
 	app, loop, manager := hostLoopOver(t, DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware), windows, events...)
 	if err := loop.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+	if err := loop.RequestDevice(0, nil); err != nil {
+		loop.Stop()
+		t.Fatalf("RequestDevice: %v", err)
 	}
 	return app, loop, manager
 }
@@ -92,6 +97,32 @@ func startedHostLoop(t *testing.T, window platform.PlatformWindow, events ...pla
 	}
 	opened.Show()
 	return app, loop, opened
+}
+
+// mockedRunPlatform makes the next Run open window and get a renderer that
+// has no GPU: its surface is sized to the window and never configured, so an
+// acquire is attempted and fails.
+func mockedRunPlatform(t *testing.T, window platform.PlatformWindow) {
+	t.Helper()
+	manager := &queuedEventManager{windows: []platform.PlatformWindow{window}}
+	oldManager := newPlatformManagerFn
+	newPlatformManagerFn = func() platform.PlatformManager { return manager }
+	oldRenderer := newRendererFn
+	newRendererFn = func(platformWindow platform.PlatformWindow, _ types.GraphicsAPI, _ bool, _ bool, _ deviceRequest) (*Renderer, error) {
+		renderer := &Renderer{}
+		width, height := platformWindow.PhysicalSize()
+		renderer.primary = &RenderTarget{
+			renderer:   renderer,
+			platWindow: platformWindow,
+			width:      uint32(width),
+			height:     uint32(height),
+		}
+		return renderer, nil
+	}
+	t.Cleanup(func() {
+		newPlatformManagerFn = oldManager
+		newRendererFn = oldRenderer
+	})
 }
 
 // enabledStats turns frame stats on for the test: a failed acquire records a
@@ -137,8 +168,11 @@ func TestHostLoop_RunRefusesWhileStarted(t *testing.T) {
 	}
 }
 
-func TestHostLoop_StartOpensNoWindow(t *testing.T) {
-	app, loop, manager := startedHostLoopWithNoWindow(t, nil)
+func TestHostLoop_StartOpensNoWindowAndRequestsNoDevice(t *testing.T) {
+	app, loop, manager := hostLoopOver(t, DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware), nil)
+	if err := loop.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer loop.Stop()
 
 	if manager.createdWindow != 0 {
@@ -150,8 +184,51 @@ func TestHostLoop_StartOpensNoWindow(t *testing.T) {
 	if !loop.Running() {
 		t.Error("Running after Start with no window: got false, want true")
 	}
-	if app.DeviceProvider().Device() == nil {
-		t.Error("Start with no window brought up no device")
+	if app.GPUContextProvider().Adapter().IsNil() {
+		t.Error("Start brought up no adapter")
+	}
+	if app.renderer.device != nil {
+		t.Error("Start brought up a device before RequestDevice")
+	}
+}
+
+func TestHostLoop_RequestDeviceBringsUpTheDevice(t *testing.T) {
+	app, loop, _ := startedHostLoopWithNoWindow(t, nil)
+	defer loop.Stop()
+
+	if app.renderer.device == nil {
+		t.Error("RequestDevice brought up no device")
+	}
+}
+
+func TestHostLoop_RequestDeviceBeforeStartFails(t *testing.T) {
+	loop := NewHostLoop(NewApp(DefaultConfig()))
+	if err := loop.RequestDevice(0, nil); err == nil {
+		t.Error("RequestDevice before Start: got nil error")
+	}
+}
+
+func TestHostLoop_RequestDeviceTwiceFails(t *testing.T) {
+	_, loop, _ := startedHostLoopWithNoWindow(t, nil)
+	defer loop.Stop()
+
+	if err := loop.RequestDevice(0, nil); err == nil {
+		t.Error("second RequestDevice: got nil error")
+	}
+}
+
+func TestHostLoop_NewWindowBeforeRequestDeviceFails(t *testing.T) {
+	_, loop, manager := hostLoopOver(t, DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware), []platform.PlatformWindow{&mockWindow{width: 800, height: 600}})
+	if err := loop.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer loop.Stop()
+
+	if _, err := loop.NewWindow(DefaultConfig()); err == nil {
+		t.Error("NewWindow before RequestDevice: got nil error")
+	}
+	if manager.createdWindow != 0 {
+		t.Errorf("NewWindow before RequestDevice created %d platform windows, want 0", manager.createdWindow)
 	}
 }
 
@@ -169,16 +246,17 @@ func TestHostLoop_StartRequestsTheFallbackAdapter(t *testing.T) {
 	}
 }
 
-func TestHostLoop_StartKeepsTheRequiredLimits(t *testing.T) {
+func TestHostLoop_RequestDeviceKeepsTheRequiredLimits(t *testing.T) {
 	limits := gputypes.DefaultLimits()
 	limits.MaxTextureDimension2D = 1024
-	config := DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware)
-	config.RequiredLimits = &limits
-	app, loop, _ := hostLoopOver(t, config, nil)
+	app, loop, _ := hostLoopOver(t, DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware), nil)
 	if err := loop.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer loop.Stop()
+	if err := loop.RequestDevice(0, &limits); err != nil {
+		t.Fatalf("RequestDevice: %v", err)
+	}
 
 	device := app.renderer.device
 	if got := device.Limits(); got != limits {
@@ -198,7 +276,7 @@ func TestHostLoop_StartKeepsTheRequiredLimits(t *testing.T) {
 	}
 }
 
-func TestHostLoop_StartFailsNamingWhatTheAdapterLacks(t *testing.T) {
+func TestHostLoop_RequestDeviceFailsNamingWhatTheAdapterLacks(t *testing.T) {
 	beyondBindGroups := gputypes.DefaultLimits()
 	beyondBindGroups.MaxBindGroups = 1 << 20
 	belowAlignment := gputypes.DefaultLimits()
@@ -216,18 +294,22 @@ func TestHostLoop_StartFailsNamingWhatTheAdapterLacks(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			config := DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware).WithRequiredFeatures(test.features)
-			config.RequiredLimits = test.limits
-			_, loop, _ := hostLoopOver(t, config, nil)
-			err := loop.Start()
+			app, loop, _ := hostLoopOver(t, DefaultConfig().WithGraphicsAPI(types.GraphicsAPISoftware), nil)
+			if err := loop.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer loop.Stop()
+			err := loop.RequestDevice(test.features, test.limits)
 			if err == nil {
-				loop.Stop()
-				t.Fatal("Start: got no error")
+				t.Fatal("RequestDevice: got no error")
 			}
 			for _, name := range test.want {
 				if !strings.Contains(err.Error(), name) {
-					t.Errorf("Start error %q does not name %s", err, name)
+					t.Errorf("RequestDevice error %q does not name %s", err, name)
 				}
+			}
+			if app.renderer.device != nil {
+				t.Error("a refused RequestDevice brought up a device")
 			}
 		})
 	}
@@ -388,6 +470,119 @@ func TestHostLoop_NotRunningAfterLastWindowCloses(t *testing.T) {
 		t.Error("Running after the last window closed: got true, want false")
 	}
 	loop.Stop() // the close destroyed the window; Stop must not panic
+}
+
+func TestHostLoop_StopBeforeStartDoesNothing(t *testing.T) {
+	loop := NewHostLoop(NewApp(DefaultConfig()))
+
+	loop.Stop() // nothing was created; Stop must not panic
+}
+
+func TestHostLoop_StopAfterFailedStartDoesNothing(t *testing.T) {
+	manager := &queuedEventManager{}
+	oldManager := newPlatformManagerFn
+	newPlatformManagerFn = func() platform.PlatformManager { return manager }
+	errNoGPU := errors.New("no GPU")
+	oldRenderer := newWindowlessRendererFn
+	newWindowlessRendererFn = func(types.GraphicsAPI, deviceRequest) (*Renderer, error) {
+		return nil, errNoGPU
+	}
+	t.Cleanup(func() {
+		newPlatformManagerFn = oldManager
+		newWindowlessRendererFn = oldRenderer
+	})
+
+	loop := NewHostLoop(NewApp(DefaultConfig()))
+	if err := loop.Start(); !errors.Is(err, errNoGPU) {
+		t.Fatalf("Start without a renderer: got %v, want %v", err, errNoGPU)
+	}
+	loop.Stop() // Start destroyed what it created; Stop must not panic
+}
+
+func TestHostLoop_StopTwiceTearsDownOnce(t *testing.T) {
+	app, loop, _ := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+	closeCount := 0
+	app.OnClose(func() { closeCount++ })
+
+	loop.Stop()
+	loop.Stop()
+	if closeCount != 1 {
+		t.Errorf("onClose after two Stops: called %d times, want 1", closeCount)
+	}
+}
+
+// windowlessManager starts, then fails to create any window, and counts how
+// often it is destroyed.
+type windowlessManager struct {
+	mockManager
+	destroyCount int
+}
+
+var errNoWindow = errors.New("no window")
+
+func (m *windowlessManager) CreateWindow(platform.Config) (platform.PlatformWindow, error) {
+	return nil, errNoWindow
+}
+
+func (m *windowlessManager) Destroy() { m.destroyCount++ }
+
+func TestRun_DestroysPlatformWhenWindowFails(t *testing.T) {
+	manager := &windowlessManager{}
+	oldManager := newPlatformManagerFn
+	newPlatformManagerFn = func() platform.PlatformManager { return manager }
+	t.Cleanup(func() { newPlatformManagerFn = oldManager })
+
+	if err := NewApp(DefaultConfig()).Run(); !errors.Is(err, errNoWindow) {
+		t.Fatalf("Run without a window: got %v, want %v", err, errNoWindow)
+	}
+	if manager.destroyCount != 1 {
+		t.Errorf("platform after a Run whose window failed: destroyed %d times, want 1", manager.destroyCount)
+	}
+}
+
+// liveResizeWindow records the live-resize hooks installed on it.
+type liveResizeWindow struct {
+	mockWindow
+	resizeHook     func()
+	phaseStartHook func()
+	phaseEndHook   func()
+}
+
+func (w *liveResizeWindow) SetLiveResizeHook(hook func()) { w.resizeHook = hook }
+
+func (w *liveResizeWindow) SetLiveResizePhaseHooks(start, end func()) {
+	w.phaseStartHook = start
+	w.phaseEndHook = end
+}
+
+func TestHostLoop_NewWindowInstallsNoLiveResizeHooks(t *testing.T) {
+	window := &liveResizeWindow{mockWindow: mockWindow{width: 800, height: 600}}
+	_, loop, _ := startedHostLoop(t, window)
+	defer loop.Stop()
+
+	if window.resizeHook != nil {
+		t.Error("live-resize hook after NewWindow: installed, want none, so nothing draws inside PumpEvents")
+	}
+	if window.phaseStartHook != nil || window.phaseEndHook != nil {
+		t.Error("live-resize phase hooks after NewWindow: installed, want none")
+	}
+}
+
+func TestRun_InstallsLiveResizeHooks(t *testing.T) {
+	window := &liveResizeWindow{mockWindow: mockWindow{width: 800, height: 600}}
+	mockedRunPlatform(t, window)
+	app := NewApp(DefaultConfig())
+	app.OnUpdate(func(float64) { app.Quit() })
+
+	if err := app.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if window.resizeHook == nil {
+		t.Error("live-resize hook after Run: none, want Run's, which draws during a macOS live resize")
+	}
+	if window.phaseStartHook == nil || window.phaseEndHook == nil {
+		t.Error("live-resize phase hooks after Run: none, want Run's")
+	}
 }
 
 func TestHostLoop_BeginFrameAcquires(t *testing.T) {
@@ -758,6 +953,85 @@ func TestHostLoop_PumpEventsDispatches(t *testing.T) {
 	}
 	if queuedEventCount != 3 {
 		t.Errorf("input event queue: got %d events, want 3", queuedEventCount)
+	}
+}
+
+func TestHostLoop_FrameAcquiresAndPresents(t *testing.T) {
+	app, loop, window := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+	defer loop.Stop()
+
+	for frame := range 2 {
+		context, ok, err := loop.BeginFrame(window)
+		if !ok || err != nil {
+			t.Fatalf("BeginFrame %d on the software backend: got ok=%v, error %v; want true, nil", frame, ok, err)
+		}
+		context.Clear(0.1, 0.2, 0.3, 1)
+		if err := loop.EndFrame(context); err != nil {
+			t.Errorf("EndFrame %d: %v", frame, err)
+		}
+		if app.renderer.currentSurface != nil {
+			t.Errorf("renderer's current surface after EndFrame %d: set, want none", frame)
+		}
+	}
+}
+
+func TestHostLoop_BeginFrameReconfiguresLostSurface(t *testing.T) {
+	_, loop, window := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+	defer loop.Stop()
+
+	surface := window.surface
+	surface.state = SurfaceLost
+	context, ok, err := loop.BeginFrame(window)
+	if !ok || err != nil {
+		t.Fatalf("BeginFrame on a lost surface: got ok=%v, error %v; want true, nil after the reconfigure", ok, err)
+	}
+	if err := loop.EndFrame(context); err != nil {
+		t.Errorf("EndFrame: %v", err)
+	}
+	if !surface.CanRender() {
+		t.Error("surface after BeginFrame on a lost one: cannot render, want it reconfigured")
+	}
+}
+
+func TestHostLoop_ConsumeRedrawRequestBeforeStart(t *testing.T) {
+	app := NewApp(DefaultConfig())
+	loop := NewHostLoop(app)
+
+	app.RequestRedraw()
+	if loop.ConsumeRedrawRequest() {
+		t.Error("ConsumeRedrawRequest before Start: got true, want false")
+	}
+}
+
+func TestHostLoop_ConsumeRedrawRequestReportsEachRequestOnce(t *testing.T) {
+	app, loop, _ := startedHostLoop(t, &mockWindow{width: 800, height: 600})
+	defer loop.Stop()
+
+	if !loop.ConsumeRedrawRequest() {
+		t.Error("first call after Start: got false, want true for the first frame")
+	}
+	if loop.ConsumeRedrawRequest() {
+		t.Error("call with no request since the last: got true, want false")
+	}
+	app.RequestRedraw()
+	app.RequestRedraw()
+	if !loop.ConsumeRedrawRequest() {
+		t.Error("call after two RequestRedraw: got false, want true")
+	}
+	if loop.ConsumeRedrawRequest() {
+		t.Error("second call after two RequestRedraw: got true, want false, the requests coalesce")
+	}
+}
+
+func TestHostLoop_ConsumeRedrawRequestAfterPumpedResize(t *testing.T) {
+	_, loop, _ := startedHostLoop(t, &mockWindow{windowID: 7, width: 800, height: 600},
+		platform.Event{Type: platform.EventResize, WindowID: 7, Width: 1024, Height: 768, PhysicalWidth: 1024, PhysicalHeight: 768})
+	defer loop.Stop()
+
+	loop.ConsumeRedrawRequest() // Start's first frame
+	loop.PumpEvents()
+	if !loop.ConsumeRedrawRequest() {
+		t.Error("call after a pumped resize: got false, want true")
 	}
 }
 

@@ -211,8 +211,8 @@ const (
 	gwlStyle = ^uintptr(15) // GWL_STYLE = -16 as unsigned uintptr
 
 	// SetWindowPos hwnd constants for Z-order
-	hwndTopmost   = ^uintptr(0)                 // HWND_TOPMOST (-1)
-	hwndNotopmost = uintptr(0xFFFFFFFFFFFFFFFE) // HWND_NOTOPMOST (-2)
+	hwndTopmost   = ^uintptr(0) // HWND_TOPMOST (-1)
+	hwndNotopmost = ^uintptr(1) // HWND_NOTOPMOST (-2)
 
 	// GetSystemMetrics / MonitorFromWindow constants
 	smCXSizeFrame           = 32 // SM_CXSIZEFRAME
@@ -239,6 +239,35 @@ const (
 	waActive      = 1      // WA_ACTIVE
 	waClickActive = 2      // WA_CLICKACTIVE
 
+	// IMM32 (Input Method Manager) composition messages and flags.
+	wmIMESetContext       = 0x0281 // WM_IME_SETCONTEXT
+	wmIMEStartComposition = 0x010D // WM_IME_STARTCOMPOSITION
+	wmIMEEndComposition   = 0x010E // WM_IME_ENDCOMPOSITION
+	wmIMEComposition      = 0x010F // WM_IME_COMPOSITION
+	wmIMEChar             = 0x0286 // WM_IME_CHAR
+
+	iscShowUICompositionWindow = 0x80000000 // ISC_SHOWUICOMPOSITIONWINDOW
+
+	gcsCompStr   = 0x0008 // GCS_COMPSTR
+	gcsCompAttr  = 0x0010 // GCS_COMPATTR
+	gcsCursorPos = 0x0080 // GCS_CURSORPOS
+	gcsResultStr = 0x0800 // GCS_RESULTSTR
+
+	cfsPoint           = 0x0001 // CFS_POINT (COMPOSITIONFORM)
+	immCFSCandidatePos = 0x0040 // CFS_CANDIDATEPOS (CANDIDATEFORM)
+	immCFSExclude      = 0x0080 // CFS_EXCLUDE (CANDIDATEFORM)
+
+	immNicompositionstr = 0x0015 // NI_COMPOSITIONSTR
+	immCpsCancel        = 0x0004 // CPS_CANCEL
+
+	iacChildren = 0x0001 // IACE_CHILDREN: no IME context for this window
+	iacDefault  = 0x0010 // IACE_DEFAULT: the window's default IME context
+
+	// wmIMEApply is posted by IMEController calls made from any goroutine; the
+	// window thread applies the native IMM32 state (the IMM32 API is bound to
+	// the thread that owns the window).
+	wmIMEApply = 0x0402 // WM_USER + 2
+
 	// WaitEvents / WakeUp constants
 	wmWakeUp       = 0x0401     // WM_USER + 1 (custom wakeup message)
 	qsAllinput     = 0x04FF     // QS_ALLINPUT
@@ -251,6 +280,9 @@ const (
 	// Registry constants
 	hkeyCurrentUser uintptr = 0x80000001
 	keyRead         uintptr = 0x20019
+
+	// GDI GetDeviceCaps index for the screen DPI fallback (issue #472).
+	logpixelsx = 88 // LOGPIXELSX
 )
 
 // msgStruct is the Windows MSG structure for PeekMessage.
@@ -307,6 +339,18 @@ var (
 	procMsgWaitForMultipleObjectsEx = user32.NewProc("MsgWaitForMultipleObjectsEx")
 	procPostMessageW                = user32.NewProc("PostMessageW")
 
+	// IMM32 (Input Method Manager). ImmGetContext, the composition-string
+	// reads and the form setters are bound to the thread that owns the window;
+	// they run only from the window procedure (see wmIMEApply).
+	imm32                        = windows.NewLazyDLL("imm32.dll")
+	procImmGetContext            = imm32.NewProc("ImmGetContext")
+	procImmReleaseContext        = imm32.NewProc("ImmReleaseContext")
+	procImmGetCompositionStringW = imm32.NewProc("ImmGetCompositionStringW")
+	procImmSetCandidateWindow    = imm32.NewProc("ImmSetCandidateWindow")
+	procImmSetCompositionWindow  = imm32.NewProc("ImmSetCompositionWindow")
+	procImmNotifyIME             = imm32.NewProc("ImmNotifyIME")
+	procImmAssociateContextEx    = imm32.NewProc("ImmAssociateContextEx")
+
 	// DPI
 	procGetDpiForWindow               = user32.NewProc("GetDpiForWindow")
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
@@ -362,6 +406,7 @@ var (
 	gdi32                 = windows.NewLazyDLL("gdi32.dll")
 	procGetDC             = user32.NewProc("GetDC")
 	procReleaseDC         = user32.NewProc("ReleaseDC")
+	procGetDeviceCaps     = gdi32.NewProc("GetDeviceCaps")
 	procSetDIBitsToDevice = gdi32.NewProc("SetDIBitsToDevice")
 	procGetStockObject    = gdi32.NewProc("GetStockObject")
 	procCreateRectRgn     = gdi32.NewProc("CreateRectRgn")
@@ -497,6 +542,23 @@ type win32Size struct {
 	cx, cy int32
 }
 
+// candidateForm mirrors the Win32 CANDIDATEFORM structure used by
+// ImmSetCandidateWindow. Coordinates are screen pixels.
+type candidateForm struct {
+	dwIndex      uint32
+	dwStyle      uint32
+	ptCurrentPos point
+	rcArea       rect
+}
+
+// compositionForm mirrors the Win32 COMPOSITIONFORM structure used by
+// ImmSetCompositionWindow. Coordinates are screen pixels.
+type compositionForm struct {
+	dwStyle      uint32
+	ptCurrentPos point
+	rcArea       rect
+}
+
 // win32Window holds all per-window state for a single Win32 window.
 // Implements both per-window methods on windowsPlatform (legacy Platform)
 // and the PlatformWindow interface (multi-window PlatformManager).
@@ -557,6 +619,22 @@ type win32Window struct {
 	minHeight int
 	maxWidth  int
 	maxHeight int
+
+	// IME state. The tracker and the desired state are shared between the
+	// window thread and IMEController calls from any goroutine, so imeMu
+	// guards them; the native IMM32 calls themselves run only on the window
+	// thread, through the wmIMEApply message.
+	imeMu            sync.Mutex
+	imeDestroyed     bool
+	ime              imeTracker
+	imeOpenApplied   bool // native IME context associated as the app asked
+	imeApplyPosted   bool // a wmIMEApply message is already queued
+	imeCancelPending bool // NI_COMPOSITIONSTR/CPS_CANCEL not yet sent
+	imeArea          gpucontext.IMECursorArea
+	imeAreaSet       bool
+	imePurpose       gpucontext.ContentPurpose
+	imeHints         gpucontext.ContentHint
+	imeSurrounding   gpucontext.IMESurroundingText
 }
 
 // windowsPlatform implements Platform for Windows.
@@ -693,6 +771,43 @@ func monitorDpiFromPoint(x, y int32, usePrimary bool) uint32 {
 	return dpiX
 }
 
+// dpiForWindow returns the window's effective DPI. user32!GetDpiForWindow
+// exists only from Windows 10 1607; on older systems the lazy call would panic
+// at the first window (issue #472), so the export is probed once and the screen
+// DC's LOGPIXELSX is the fallback. hwnd may be 0, which also selects the
+// fallback.
+func dpiForWindow(hwnd uintptr) uint32 {
+	dpiForWindowOnce.Do(func() {
+		dpiForWindowFound = procGetDpiForWindow.Find() == nil
+	})
+	return dpiForWindowWith(dpiForWindowFound, hwnd)
+}
+
+// dpiForWindowWith is the testable form of dpiForWindow: found says whether
+// user32 exports GetDpiForWindow.
+func dpiForWindowWith(found bool, hwnd uintptr) uint32 {
+	if found && hwnd != 0 {
+		if dpi, _, _ := syscall.SyscallN(procGetDpiForWindow.Addr(), hwnd); dpi != 0 {
+			return uint32(dpi)
+		}
+	}
+	hdc, _, _ := syscall.SyscallN(procGetDC.Addr(), 0) // screen DC
+	if hdc == 0 {
+		return 96
+	}
+	dpi, _, _ := syscall.SyscallN(procGetDeviceCaps.Addr(), hdc, logpixelsx)
+	syscall.SyscallN(procReleaseDC.Addr(), 0, hdc)
+	if dpi == 0 {
+		return 96
+	}
+	return uint32(dpi)
+}
+
+var (
+	dpiForWindowOnce  sync.Once
+	dpiForWindowFound bool
+)
+
 // adjustWindowRectForDpi adjusts r (initially client rect) to include the window frame
 // at the given DPI. Falls back to AdjustWindowRectEx on pre-Win10 1607 systems.
 func adjustWindowRectForDpi(r *rect, style uintptr, dpi uint32) {
@@ -810,8 +925,8 @@ func (p *windowsPlatform) createWindowWin32(config Config) (*win32Window, error)
 
 	// Post-create verify — if the window landed on a monitor with a
 	// different DPI than our guess, recalculate and reposition.
-	actualDpi, _, _ := procGetDpiForWindow.Call(hwnd)
-	if actualDpi != 0 && uint32(actualDpi) != guessDpi {
+	actualDpi := dpiForWindow(hwnd)
+	if actualDpi != guessDpi {
 		actualScale := float64(actualDpi) / 96.0
 		fixRect := rect{
 			left:   0,
@@ -819,7 +934,7 @@ func (p *windowsPlatform) createWindowWin32(config Config) (*win32Window, error)
 			right:  int32(float64(config.Width) * actualScale),
 			bottom: int32(float64(config.Height) * actualScale),
 		}
-		adjustWindowRectForDpi(&fixRect, style, uint32(actualDpi))
+		adjustWindowRectForDpi(&fixRect, style, actualDpi)
 		fixW := fixRect.right - fixRect.left
 		fixH := fixRect.bottom - fixRect.top
 		procSetWindowPos.Call(hwnd, 0, 0, 0,
@@ -841,6 +956,10 @@ func (p *windowsPlatform) createWindowWin32(config Config) (*win32Window, error)
 	p.windowMu.Lock()
 	p.windows[w.hwnd] = w
 	p.windowMu.Unlock()
+
+	// IME starts disabled: a focused text widget enables it. Detaching the
+	// context before the first message keeps the IME out of non-text windows.
+	w.initIMEState()
 
 	// Enable file drag-and-drop (WM_DROPFILES from shell32).
 	procDragAcceptFiles.Call(uintptr(w.hwnd), 1) // TRUE
@@ -1112,10 +1231,7 @@ func (w *win32Window) RequestSize(width, height int) {
 	}
 
 	// Scale logical DIP to physical pixels.
-	dpi, _, _ := procGetDpiForWindow.Call(uintptr(w.hwnd))
-	if dpi == 0 {
-		dpi = 96
-	}
+	dpi := dpiForWindow(uintptr(w.hwnd))
 	scale := float64(dpi) / 96.0
 	physW := int32(float64(width) * scale)
 	physH := int32(float64(height) * scale)
@@ -1123,7 +1239,7 @@ func (w *win32Window) RequestSize(width, height int) {
 	// Add window frame to get outer dimensions.
 	style, _, _ := procGetWindowLongPtrW.Call(uintptr(w.hwnd), gwlStyle)
 	outerRect := rect{left: 0, top: 0, right: physW, bottom: physH}
-	adjustWindowRectForDpi(&outerRect, style, uint32(dpi))
+	adjustWindowRectForDpi(&outerRect, style, dpi)
 
 	outerW := uintptr(outerRect.right - outerRect.left)
 	outerH := uintptr(outerRect.bottom - outerRect.top)
@@ -1171,10 +1287,7 @@ func (w *win32Window) Hide() {
 // scaling to physical pixels with the window's current DPI. Size and
 // Z-order are preserved (winit pattern).
 func (w *win32Window) SetPosition(x, y int) {
-	dpi, _, _ := procGetDpiForWindow.Call(uintptr(w.hwnd))
-	if dpi == 0 {
-		dpi = 96
-	}
+	dpi := dpiForWindow(uintptr(w.hwnd))
 	scale := float64(dpi) / 96.0
 	physX := int32(float64(x) * scale)
 	physY := int32(float64(y) * scale)
@@ -1241,14 +1354,23 @@ func (w *win32Window) StartDrag(paths []string, done func(DragResult)) {
 }
 
 func (w *win32Window) Destroy() {
+	w.destroyIMEState()
 	if w.platform != nil {
 		w.platform.windowMu.Lock()
 		delete(w.platform.windows, w.hwnd)
 		w.platform.windowMu.Unlock()
 	}
-	if w.hwnd != 0 {
-		procDestroyWindow.Call(uintptr(w.hwnd))
+	// The HWND is read under imeMu: IMEController calls from other goroutines
+	// capture it there (imeContext), and Destroy runs while they may still be
+	// in flight.
+	w.imeMu.Lock()
+	hwnd := uintptr(w.hwnd)
+	w.imeMu.Unlock()
+	if hwnd != 0 {
+		procDestroyWindow.Call(hwnd)
+		w.imeMu.Lock()
 		w.hwnd = 0
+		w.imeMu.Unlock()
 	}
 }
 
@@ -1290,7 +1412,27 @@ func (p *windowsPlatform) PollEvents() Event {
 		syscall.SyscallN(procDispatchMessageW.Addr(), uintptr(unsafe.Pointer(&p.polledMessage)))
 	}
 
+	// If an IME ended without a post-END WM_CHAR result, terminate the pending
+	// lifecycle now rather than leaving it open indefinitely. The adapter maps
+	// an empty post-END result to cancellation.
+	p.flushPendingIMECharResults()
+
 	return p.dequeueEvent()
+}
+
+// flushPendingIMECharResults closes a post-END character-result lifecycle
+// that no further WM_CHAR message completed.
+func (p *windowsPlatform) flushPendingIMECharResults() {
+	p.windowMu.RLock()
+	defer p.windowMu.RUnlock()
+	for _, w := range p.windows {
+		w.imeMu.Lock()
+		pending := w.ime.hasPendingCharResult()
+		w.imeMu.Unlock()
+		if pending {
+			w.finishIMECharResult()
+		}
+	}
 }
 
 func (p *windowsPlatform) ShouldClose() bool {
@@ -1325,10 +1467,7 @@ func (w *win32Window) PhysicalSize() (width, height int) {
 // scaleFactor returns the DPI scale factor for the window.
 // Must NOT hold sizeMu (calls syscall).
 func (w *win32Window) scaleFactor() float64 {
-	dpi, _, _ := syscall.SyscallN(procGetDpiForWindow.Addr(), uintptr(w.hwnd))
-	if dpi == 0 {
-		return 1.0
-	}
+	dpi := dpiForWindow(uintptr(w.hwnd))
 	return float64(dpi) / 96.0
 }
 
@@ -1377,15 +1516,24 @@ func (w *win32Window) setModalFrameCallback(fn func()) {
 // Same pattern as win32Window.Destroy and GLFW's RemovePropW-before-DestroyWindow.
 func (p *windowsPlatform) Destroy() {
 	p.windowMu.Lock()
-	toDestroy := make([]windows.HWND, 0, len(p.windows))
-	for hwnd := range p.windows {
-		toDestroy = append(toDestroy, hwnd)
+	toDestroy := make([]*win32Window, 0, len(p.windows))
+	for hwnd, w := range p.windows {
+		toDestroy = append(toDestroy, w)
 		delete(p.windows, hwnd)
 	}
 	p.windowMu.Unlock()
 
-	for _, hwnd := range toDestroy {
-		procDestroyWindow.Call(uintptr(hwnd))
+	for _, w := range toDestroy {
+		if w == nil {
+			continue
+		}
+		w.destroyIMEState()
+		w.imeMu.Lock()
+		hwnd := uintptr(w.hwnd)
+		w.imeMu.Unlock()
+		if hwnd != 0 {
+			procDestroyWindow.Call(hwnd)
+		}
 	}
 	p.hMenu = 0
 	p.primary = nil
@@ -2883,6 +3031,11 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 
 	case wmKillFocus:
 		p.queueEvent(Event{Type: EventFocus, WindowID: w.id, Focused: false})
+		// Losing focus cancels any preedit and detaches the native IME before
+		// the next focus target can receive composition messages. App keeps the
+		// enabled state a widget configured; that widget re-asserts
+		// SetIMEEnabled(true) when focus returns to it.
+		w.SetIMEEnabled(false)
 		return 0
 
 	case wmActivate:
@@ -2960,6 +3113,7 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 
 		// Update cached client size after DPI-driven resize.
 		w.updateSize()
+		w.applyStoredIMECursorArea()
 
 		// Emit ScaleChanged BEFORE Resize (cause before effect, ADR-059).
 		logW, logH := w.LogicalSize()
@@ -3026,8 +3180,8 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 			// On Windows, WM_SIZE provides physical pixels (client rect).
 			// Compute logical size from DPI scale for the event.
 			logW, logH := newWidth, newHeight
-			dpi, _, _ := syscall.SyscallN(procGetDpiForWindow.Addr(), uintptr(w.hwnd))
-			if dpi > 0 && dpi != 96 {
+			dpi := dpiForWindow(uintptr(w.hwnd))
+			if dpi != 96 {
 				scale := float64(dpi) / 96.0
 				logW = int(float64(newWidth) / scale)
 				logH = int(float64(newHeight) / scale)
@@ -3117,6 +3271,7 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		}
 
 	case wmKeydown, wmSysKeydown:
+		w.beforeIMEKeyDown()
 		// Convert to Key using scancode-based translation (GLFW/Ebiten pattern)
 		// This correctly handles Left/Right modifiers and AltGr
 		key := translateKey(wParam, lParam)
@@ -3159,12 +3314,20 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		// For WM_SYSKEYUP: suppress menu activation
 		return 0
 
-	case wmChar, wmSysChar:
+	case wmChar, wmSysChar, wmIMEChar:
 		// WM_CHAR/WM_SYSCHAR are generated by TranslateMessage().
 		// wParam is a UTF-16 code unit -- supplementary characters (emoji, CJK)
 		// arrive as two consecutive messages: high surrogate then low surrogate.
 		// Pattern: GLFW 3.4 win32_window.c + Ebiten textinput_windows.go
 		codeUnit := uint16(wParam)
+		// A committed IME result may echo back as WM_CHAR after the composition
+		// ended; it was already delivered through EventIMECompositionEnd.
+		if w.consumeIMECharResult(codeUnit) {
+			return 0
+		}
+		if w.consumeIMECharUnit(codeUnit) {
+			return 0
+		}
 		if codeUnit >= 0xD800 && codeUnit <= 0xDBFF {
 			// High surrogate -- store and wait for low surrogate
 			w.highSurrogate = codeUnit
@@ -3192,9 +3355,42 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 			return 1 // "Yes, we support WM_UNICHAR"
 		}
 		char := rune(wParam)
+		// A committed IME result may echo back as WM_UNICHAR; it was already
+		// delivered through EventIMECompositionEnd.
+		if char >= 0 && char <= 0x10FFFF && w.consumeIMEUnichar(char) {
+			return 0
+		}
 		if char >= 32 && char != 127 {
 			p.queueEvent(Event{WindowID: w.id, Type: EventChar, Char: char})
 		}
+		return 0
+
+	case wmIMESetContext:
+		// The application renders the preedit itself, so keep the IME from
+		// drawing its own composition window (winit, SDL3).
+		lParam &^= iscShowUICompositionWindow
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(message), wParam, lParam)
+		return ret
+
+	case wmIMEStartComposition:
+		w.handleIMEStart()
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(message), wParam, lParam)
+		return ret
+
+	case wmIMEComposition:
+		// Handling the message without DefWindowProc is what hides the text
+		// the IME would otherwise draw (winit).
+		w.handleIMEComposition(lParam)
+		return 0
+
+	case wmIMEEndComposition:
+		w.handleIMEEnd()
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(message), wParam, lParam)
+		return ret
+
+	case wmIMEApply:
+		// Posted by gpucontext.IMEController calls from any goroutine.
+		w.applyIMENativeState()
 		return 0
 
 	case wmSetCursor:

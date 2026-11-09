@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/gogpu/gogpu/internal/platform"
+	"github.com/gogpu/gputypes"
 )
 
 // HostLoop lets a host that owns its loop drive an App one step at a time,
@@ -16,6 +17,9 @@ import (
 //
 //	loop := gogpu.NewHostLoop(app)
 //	if err := loop.Start(); err != nil {
+//		return err
+//	}
+//	if err := loop.RequestDevice(0, nil); err != nil {
 //		return err
 //	}
 //	window, err := loop.NewWindow(gogpu.DefaultConfig())
@@ -43,13 +47,16 @@ import (
 // documented, not checked, as for Run. gogpu runs no render thread for a
 // HostLoop: acquire and present happen on the caller's thread.
 //
-// Windows: no modal timer runs, so during a move or resize the frame freezes
-// and resumes at the new size when the user lets go.
+// Windows and macOS: a move or resize the user drags on Windows, and a live
+// resize on macOS, run the platform's own loop inside PumpEvents, which
+// returns when the user lets go. gogpu draws nothing meanwhile, so the frame
+// freezes and resumes at the new size.
 //
 // macOS: each frame runs inside an autorelease pool that BeginFrame pushes and
 // EndFrame pops.
 type HostLoop struct {
 	app       *App
+	started   bool    // Start succeeded and Stop has not torn the app down yet
 	framePool uintptr // macOS autorelease pool open between BeginFrame and EndFrame
 }
 
@@ -58,14 +65,18 @@ func NewHostLoop(app *App) *HostLoop {
 	return &HostLoop{app: app}
 }
 
-// Start brings up the platform and the GPU instance, adapter and device, with
-// no window and no surface, and marks the app running, then returns without
-// blocking. Windows open through NewWindow. When the platform or the GPU
-// cannot start, it returns the error and destroys what it had created. While
-// a HostLoop is started, Run and a second Start return ErrHostLoopStarted.
+// Start brings up the platform and the GPU instance and adapter, with no
+// device, no window and no surface, and marks the app running, then returns
+// without blocking. The device comes from RequestDevice, once the host has
+// read the adapter through GPUContextProvider; windows open through
+// NewWindow after it. When the platform or the GPU cannot start, it returns
+// the error and destroys what it had created. While a HostLoop is started,
+// Run and a second Start return ErrHostLoopStarted.
 //
-// The app's Config chooses the graphics API and the power preference; its
-// window fields are not used, since Start opens no window.
+// The app's Config chooses the graphics API, the power preference and the
+// fallback adapter. Its RequiredFeatures and RequiredLimits are not used,
+// since RequestDevice is given its own, nor are its window fields, since
+// Start opens no window.
 func (loop *HostLoop) Start() error {
 	a := loop.app
 	if a.hostLoopStarted {
@@ -85,7 +96,29 @@ func (loop *HostLoop) Start() error {
 	a.windowManager = newWindowManager()
 	a.startRunLoop()
 	a.hostLoopStarted = true
+	loop.started = true
 	return nil
+}
+
+// RequestDevice requests the device from the adapter Start brought up, with
+// features and limits, as Config's RequiredFeatures and RequiredLimits ask
+// for Run: nil limits are the adapter's own. A feature or limit the adapter
+// lacks fails the request by name, and no device is created. It must be
+// called once, after Start and before NewWindow, on Start's thread.
+func (loop *HostLoop) RequestDevice(features gputypes.Features, limits *gputypes.Limits) error {
+	a := loop.app
+	if !a.hostLoopStarted {
+		return fmt.Errorf("gogpu: HostLoop.RequestDevice called before Start")
+	}
+	if a.renderer.device != nil {
+		return fmt.Errorf("gogpu: HostLoop.RequestDevice called twice")
+	}
+	a.renderer.deviceRequest.requiredFeatures = features
+	a.renderer.deviceRequest.requiredLimits = gputypes.Limits{}
+	if limits != nil {
+		a.renderer.deviceRequest.requiredLimits = *limits
+	}
+	return a.renderer.requestDevice()
 }
 
 // NewWindow opens a window with its surface, from config's title, size,
@@ -98,12 +131,15 @@ func (loop *HostLoop) Start() error {
 // when the window already reports a size, and otherwise at the first
 // BeginFrame that finds one.
 //
-// It must be called after Start, on Start's thread. A window closed by the
+// It must be called after RequestDevice, on Start's thread. A window closed by the
 // user, or by Window.Close, is destroyed with its surface as App.NewWindow's
 // windows are.
 func (loop *HostLoop) NewWindow(config Config) (*Window, error) {
 	if !loop.app.hostLoopStarted {
 		return nil, fmt.Errorf("gogpu: HostLoop.NewWindow called before Start")
+	}
+	if loop.app.renderer.device == nil {
+		return nil, fmt.Errorf("gogpu: HostLoop.NewWindow called before RequestDevice")
 	}
 	return loop.app.openWindow(config, config.VSync)
 }
@@ -115,9 +151,10 @@ func (loop *HostLoop) NewWindow(config Config) (*Window, error) {
 // the window's next BeginFrame. A close destroys the window with its surface.
 // It ends the gesture frame.
 //
-// It never waits, runs onUpdate or draws, and returns once the queue is
-// empty. A pump allocates nothing apart from boxing each event it puts into
-// the input-event queue, once per event, and the text of a typed character
+// It never runs onUpdate or draws, and returns once the queue is empty. It
+// waits only while the user drags a move or resize (see HostLoop). A pump
+// allocates nothing apart from boxing each event it puts into the
+// input-event queue, once per event, and the text of a typed character
 // outside ASCII, once for every text-input callback. Its first pumps also
 // resolve the system functions they call and grow its buffers to their
 // largest size; neither recurs.
@@ -130,6 +167,22 @@ func (loop *HostLoop) PumpEvents() {
 // window closed (see App.SetQuitOnLastWindowClosed).
 func (loop *HostLoop) Running() bool {
 	return loop.app.running.Load()
+}
+
+// ConsumeRedrawRequest reports whether a redraw was requested since its last
+// call, and clears the request. Requests come from App.RequestRedraw and the
+// GPU context provider's RequestRedraw, from any goroutine; from the events
+// PumpEvents dispatches that change what a window shows, such as a resize or
+// a focus change; and from an EndFrame whose surface turned out outdated.
+// Start requests the first frame.
+//
+// A host that draws on demand calls it once per tick and draws its windows
+// when it reports true, as Run does: the request is the App's, not one
+// window's. Config.ContinuousRender does not apply to a HostLoop; the host
+// draws whenever it chooses.
+func (loop *HostLoop) ConsumeRedrawRequest() bool {
+	invalidator := loop.app.invalidator
+	return invalidator != nil && invalidator.Consume()
 }
 
 // BeginFrame applies the window's latest size to its surface and acquires the
@@ -234,11 +287,19 @@ func (loop *HostLoop) EndFrame(context *Context) error {
 }
 
 // Stop closes every window still open, with its surface, as a close does,
-// then waits for the GPU and releases the device and the platform, in Run's
-// teardown order: GPU wait, deferred destroys, tracked resources and
-// onClose; renderer; platform; GPU instance. The app cannot be started
-// again.
+// then waits for the GPU and releases the device, if one was requested, and
+// the platform, in Run's teardown order: GPU wait, deferred destroys, tracked
+// resources and onClose; renderer; platform; GPU instance. The app cannot be
+// started again.
+//
+// Stop does nothing unless this loop's Start succeeded, and nothing the
+// second time: a Start that failed has already destroyed what it created, so
+// a deferred Stop is safe whether Start succeeded or not.
 func (loop *HostLoop) Stop() {
+	if !loop.started {
+		return
+	}
+	loop.started = false
 	a := loop.app
 	a.windowManager.mu.RLock()
 	windows := slices.Clone(a.windowManager.order)
@@ -284,6 +345,7 @@ func (loop *HostLoop) start(renderLoop appRenderLoop, modalFrameCallback func())
 	a.syncInitialSurfaceSize()
 	a.registerPrimaryWindow(platWindow)
 	a.startRunLoop()
+	loop.started = true
 	return nil
 }
 
