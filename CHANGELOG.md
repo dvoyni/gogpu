@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HostLoop.RequestDevice`** (@dvoyni). Requests the device after `Start`, with the required features and limits the
   host chose once it read the adapter through `GPUContextProvider`. Nil limits are the adapter's own; a feature or limit
   the adapter lacks fails the request by name, and no device is created.
+- **`Window.Destroy`** (@dvoyni). Closes any window at once, the first included, on macOS, Windows, X11 and Wayland,
+  without asking its close callback. macOS's platform window now destroys itself, and its pump drains AppKit's events
+  with no window open; X11's first window keeps its connection, and the clipboard moves to a window still open;
+  Wayland's first window closes its connection, and the next window opens a new one.
 
 ### Performance
 

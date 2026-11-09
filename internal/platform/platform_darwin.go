@@ -5,6 +5,7 @@ package platform
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -244,6 +245,11 @@ func (p *darwinPlatform) PollEvents() Event {
 			return e
 		}
 	}
+	// With no window open, AppKit's events are still drained: a window
+	// destroyed last leaves the screen only once they are.
+	if len(p.windows) == 0 && p.app != nil {
+		p.app.PollEventsWithHandler(nil)
+	}
 	return Event{Type: EventNone}
 }
 
@@ -281,6 +287,9 @@ func (p *darwinPlatform) WaitEvents() {
 				}
 			}
 		}
+		if target == nil {
+			return true
+		}
 		target.eventMu.Lock()
 		result := target.handleEvent(event, eventType)
 		target.eventMu.Unlock()
@@ -292,9 +301,11 @@ func (p *darwinPlatform) WaitEvents() {
 	}
 
 	// Check for resize after all events have been processed.
-	keyWin.eventMu.Lock()
-	keyWin.checkResize()
-	keyWin.eventMu.Unlock()
+	if keyWin != nil {
+		keyWin.eventMu.Lock()
+		keyWin.checkResize()
+		keyWin.eventMu.Unlock()
+	}
 }
 
 // WakeUp unblocks WaitEvents from any goroutine by posting a synthetic
@@ -311,30 +322,11 @@ func (p *darwinPlatform) Destroy() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Clean up drag handlers for all windows before destroying them, and give
-	// back a cursor a window holds.
 	for _, w := range p.windows {
-		w.cursor.setMode(cursorModeNormal)
-		if w.window != nil {
-			cv := w.window.ContentView()
-			if !cv.IsNil() {
-				darwin.ClearViewDragHandler(cv)
-			}
-		}
+		w.destroy()
 	}
-
-	w := p.primary
-	if w != nil {
-		if w.surface != nil {
-			w.surface.Destroy()
-			w.surface = nil
-		}
-
-		if w.window != nil {
-			w.window.Destroy()
-			w.window = nil
-		}
-	}
+	p.windows = nil
+	p.primary = nil
 
 	if p.app != nil {
 		p.app.Destroy()
@@ -665,8 +657,46 @@ func (dw *darwinPlatformWindow) StartDrag(paths []string, done func(DragResult))
 	startDragDarwin(dw.window, paths, done)
 }
 
+// Destroy closes the window at once with its surface. The next window still
+// open becomes the primary. A second Destroy does nothing.
 func (dw *darwinPlatformWindow) Destroy() {
-	// Destruction handled by platform.Destroy()
+	p := dw.platform
+	p.mu.Lock()
+	index := slices.IndexFunc(p.windows, func(w *darwinWindow) bool { return w.id == dw.id })
+	if index < 0 {
+		p.mu.Unlock()
+		return
+	}
+	w := p.windows[index]
+	p.windows = slices.Delete(p.windows, index, index+1)
+	if p.primary == w {
+		p.primary = nil
+		if len(p.windows) > 0 {
+			p.primary = p.windows[0]
+		}
+	}
+	p.mu.Unlock()
+	w.destroy()
+	dw.window = nil
+}
+
+// destroy gives back a cursor the window holds and clears its drag handler,
+// then releases its surface and closes the window. A second destroy does
+// nothing.
+func (w *darwinWindow) destroy() {
+	if w.window == nil {
+		return
+	}
+	w.cursor.setMode(cursorModeNormal)
+	if contentView := w.window.ContentView(); !contentView.IsNil() {
+		darwin.ClearViewDragHandler(contentView)
+	}
+	if w.surface != nil {
+		w.surface.Destroy()
+		w.surface = nil
+	}
+	w.window.Destroy()
+	w.window = nil
 }
 
 func (w *darwinWindow) pollEvents(app *darwin.Application) Event {
