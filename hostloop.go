@@ -334,9 +334,7 @@ func (loop *HostLoop) start(renderLoop appRenderLoop, modalFrameCallback func())
 	a.renderLoop = renderLoop
 
 	if err := a.initRenderer(platWindow); err != nil {
-		a.renderLoop.Stop()
-		platWindow.Destroy()
-		a.manager.Destroy()
+		a.destroyRendererAndPlatform(platWindow)
 		return err
 	}
 

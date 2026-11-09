@@ -348,9 +348,10 @@ func (a *App) NewWindow(config Config) (*Window, error) {
 
 	// Install live-resize hook for macOS so this window re-renders during drag.
 	// Without it, AppKit stretches the last frame to fill the new window size.
-	// Mirrors the primary window hook in registerPrimaryWindow.
+	// Mirrors the primary window hook in registerPrimaryWindow. A HostLoop
+	// installs none, so nothing draws inside its PumpEvents.
 	platWindow := w.platWindow
-	if lr, ok := platWindow.(platform.LiveResizeRenderer); ok {
+	if lr, ok := platWindow.(platform.LiveResizeRenderer); ok && !a.hostLoopStarted {
 		capturedW := w
 		capturedWS := w.surface
 		lr.SetLiveResizeHook(func() {

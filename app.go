@@ -467,16 +467,27 @@ func (a *App) shutdown(platWindow platform.PlatformWindow) {
 			a.onClose()
 		}
 	})
-	a.renderLoop.RunOnRenderThreadVoid(func() {
-		a.renderer.Destroy()
-	})
+	a.destroyRendererAndPlatform(platWindow)
+}
+
+// destroyRendererAndPlatform runs steps 2 to 5 of shutdown. A start whose
+// renderer failed runs it too, so what newRenderer created is released in the
+// same order. A HostLoop has no primary platform window: platWindow is nil.
+func (a *App) destroyRendererAndPlatform(platWindow platform.PlatformWindow) {
+	if a.renderer != nil {
+		a.renderLoop.RunOnRenderThreadVoid(func() {
+			a.renderer.Destroy()
+		})
+	}
 	if platWindow != nil {
 		platWindow.Destroy()
 	}
 	a.manager.Destroy()
-	a.renderLoop.RunOnRenderThreadVoid(func() {
-		a.renderer.ReleaseInstance()
-	})
+	if a.renderer != nil {
+		a.renderLoop.RunOnRenderThreadVoid(func() {
+			a.renderer.ReleaseInstance()
+		})
+	}
 	a.renderLoop.Stop()
 }
 
