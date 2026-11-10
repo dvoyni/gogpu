@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HostLoop.ReplaceDevice`** (@dvoyni). Replaces the device after a `wgpu.ErrDeviceLost`, keeping every window and
   its surface. The new device has `RequestDevice`'s features and limits, from the same adapter or a fresh one; the host
   creates its own objects again on it.
+- **Per-window fullscreen, cursor and scale** (@dvoyni). `Window` gains `SetFullscreen`, `SetCursor`, `SetCursorMode`,
+  `CursorMode`, `SetCursorPosition` and `ScaleFactor`, beside its `SetTitle`, each acting on the window it is called on,
+  as the `App` versions act on the primary window. On Windows and macOS the cursor shape was process-wide: each window
+  now keeps its own, shown while the pointer is over its content area, on macOS while the window is key, and
+  `CursorNone` hides the cursor over that window alone.
 
 ### Performance
 
