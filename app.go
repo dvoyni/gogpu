@@ -835,18 +835,7 @@ func (a *App) classifyEvent(event *platform.Event, lastResize *platform.Event, s
 		// No X11 background pixmap — repaint revealed regions ourselves.
 		a.RequestRedraw()
 	case platform.EventFocus:
-		a.focused = event.Focused
-		if w := a.windowManager.getByPlatformID(event.WindowID); w != nil {
-			if event.Focused {
-				a.windowManager.setFocus(w.id)
-			}
-			if w.onFocus != nil {
-				w.onFocus(event.Focused)
-			}
-		}
-		if a.eventSource != nil {
-			a.eventSource.dispatchFocus(event.Focused)
-		}
+		a.dispatchFocusEvent(event)
 		a.inputEvents = append(a.inputEvents, gpucontext.FocusEvent{Focused: event.Focused})
 		a.RequestRedraw()
 
@@ -884,6 +873,24 @@ func (a *App) classifyEvent(event *platform.Event, lastResize *platform.Event, s
 		}
 	}
 	return lastResize, secondaryResizes
+}
+
+// dispatchFocusEvent handles EventFocus from the platform: it records the
+// App's focus and the focused window, and reports the change to that window's
+// focus callback and to the event source.
+func (a *App) dispatchFocusEvent(event *platform.Event) {
+	a.focused = event.Focused
+	if w := a.windowManager.getByPlatformID(event.WindowID); w != nil {
+		if event.Focused {
+			a.windowManager.setFocus(w.id)
+		}
+		if w.onFocus != nil {
+			w.onFocus(event.Focused)
+		}
+	}
+	if a.eventSource != nil {
+		a.eventSource.dispatchFocus(event.Focused)
+	}
 }
 
 // dispatchKeyEvent handles EventKeyDown and EventKeyUp from the platform.
