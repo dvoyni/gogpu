@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without asking its close callback. macOS's platform window now destroys itself, and its pump drains AppKit's events
   with no window open; X11's first window keeps its connection, and the clipboard moves to a window still open;
   Wayland's first window closes its connection, and the next window opens a new one.
+- **`HostLoop.ReplaceDevice`** (@dvoyni). Replaces the device after a `wgpu.ErrDeviceLost`, keeping every window and
+  its surface. The new device has `RequestDevice`'s features and limits, from the same adapter or a fresh one; the host
+  creates its own objects again on it.
 
 ### Performance
 
