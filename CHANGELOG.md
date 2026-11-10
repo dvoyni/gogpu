@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the `App` versions act on the primary window. On Windows and macOS the cursor shape was process-wide: each window
   now keeps its own, shown while the pointer is over its content area, on macOS while the window is key, and
   `CursorNone` hides the cursor over that window alone.
+- **Per-window focus** (@dvoyni). `Window.SetOnFocus` reports to each window its own gain and loss of keyboard focus,
+  beside `App.OnFocus`, which reports every window's.
 
 ### Performance
 

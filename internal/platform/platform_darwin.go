@@ -52,9 +52,10 @@ type darwinWindow struct {
 	physW int
 	physH int
 
-	// Focus tracking: last known key window status for change detection.
+	// Focus tracking: last known key window status for change detection. A
+	// window starts unfocused, so the first poll that finds it key reports
+	// its focus, as the other platforms report a window focused at open.
 	lastKeyWindow bool
-	focusInited   bool // true after first pollEvents call
 
 	// cursor applies the cursor mode, released while the window is not key.
 	cursor darwinCursor
@@ -779,10 +780,7 @@ func (w *darwinWindow) pollEvents(app *darwin.Application) Event {
 	// NSWindow.isKeyWindow is true when the window has keyboard focus.
 	if w.window != nil {
 		isKey := w.window.IsKeyWindow()
-		if !w.focusInited {
-			w.lastKeyWindow = isKey
-			w.focusInited = true
-		} else if isKey != w.lastKeyWindow {
+		if isKey != w.lastKeyWindow {
 			w.lastKeyWindow = isKey
 			w.events.Push(Event{WindowID: w.id, Type: EventFocus, Focused: isKey})
 		}
