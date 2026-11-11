@@ -14,3 +14,7 @@ require (
 	github.com/go-webgpu/webgpu v0.5.5 // indirect
 	github.com/gogpu/naga v0.21.10 // indirect
 )
+
+// goffi is the fork beside this one in cog's submodules/goffi: its cgo builds
+// on Linux call dlopen through cgo, so -race and other external links work.
+replace github.com/go-webgpu/goffi => ../goffi
