@@ -918,9 +918,7 @@ func (a *App) classifyEvent(event *platform.Event, lastResize *platform.Event, s
 		})
 		a.RequestRedraw()
 	case platform.EventKeyboardLayoutChanged:
-		if a.onKeyboardLayoutChanged != nil {
-			a.onKeyboardLayoutChanged()
-		}
+		a.dispatchKeyboardLayoutChanged()
 	case platform.EventDragDrop:
 		if a.onFileDrop != nil {
 			a.onFileDrop(event.DragPaths, event.DragX, event.DragY)
@@ -1092,6 +1090,14 @@ func (a *App) dispatchScrollEvent(event *platform.Event) {
 	}
 	if a.inputState != nil {
 		a.inputState.Mouse().SetScroll(float32(event.Scroll.DeltaX), float32(event.Scroll.DeltaY))
+	}
+}
+
+// dispatchKeyboardLayoutChanged handles EventKeyboardLayoutChanged from the
+// platform.
+func (a *App) dispatchKeyboardLayoutChanged() {
+	if a.onKeyboardLayoutChanged != nil {
+		a.onKeyboardLayoutChanged()
 	}
 }
 
@@ -1776,9 +1782,9 @@ func (a *App) FontSmoothing() gpucontext.FontSmoothing {
 // KeyLabel answers the character the current keyboard layout prints on key,
 // a physical key named by its US QWERTY position, unshifted: 'a' for KeyQ on
 // a French layout. It answers 0 for a key that prints none, such as Enter,
-// before the layout is known, and on platforms that cannot tell: macOS and
-// the browser. OnKeyboardLayoutChanged tells when the answers change. Call it
-// on the main thread.
+// before the layout is known, and in the browser, which cannot tell.
+// OnKeyboardLayoutChanged tells when the answers change. Call it on the main
+// thread.
 func (a *App) KeyLabel(key gpucontext.Key) rune {
 	labeler, ok := a.manager.(platform.KeyLabeler)
 	if !ok {
