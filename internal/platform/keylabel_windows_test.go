@@ -16,12 +16,11 @@ var (
 	procLoadKeyboardLayoutW   = user32.NewProc("LoadKeyboardLayoutW")
 	procUnloadKeyboardLayout  = user32.NewProc("UnloadKeyboardLayout")
 	procGetKeyboardLayoutList = user32.NewProc("GetKeyboardLayoutList")
-	procUnregisterClassW      = user32.NewProc("UnregisterClassW")
 	procOleUninitialize       = ole32.NewProc("OleUninitialize")
 )
 
 // newKeyLabelTestWindow opens a hidden window on a platform of its own, and
-// tears the platform down, its window class included, when the test ends.
+// tears the platform down when the test ends.
 func newKeyLabelTestWindow(t *testing.T) *win32Window {
 	t.Helper()
 	runtime.LockOSThread()
@@ -31,11 +30,6 @@ func newKeyLabelTestWindow(t *testing.T) *win32Window {
 	}
 	t.Cleanup(func() {
 		p.Destroy()
-		name, err := windows.UTF16PtrFromString("GoGPUWindow")
-		if err != nil {
-			t.Fatal(err)
-		}
-		procUnregisterClassW.Call(uintptr(unsafe.Pointer(name)), uintptr(p.hinstance))
 		procOleUninitialize.Call()
 		runtime.UnlockOSThread()
 	})

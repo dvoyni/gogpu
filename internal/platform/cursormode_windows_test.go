@@ -15,8 +15,7 @@ var procGetClipCursor = user32.NewProc("GetClipCursor")
 
 // newCursorModeTestWindow opens a hidden window, which is not active, on a
 // platform of its own. When the test ends it releases the window's cursor
-// mode and tears the platform down, its window class included, so a later
-// test can register the class again.
+// mode and tears the platform down.
 func newCursorModeTestWindow(t *testing.T) *win32Window {
 	t.Helper()
 	runtime.LockOSThread()
@@ -26,11 +25,6 @@ func newCursorModeTestWindow(t *testing.T) *win32Window {
 	}
 	t.Cleanup(func() {
 		p.Destroy()
-		name, err := windows.UTF16PtrFromString("GoGPUWindow")
-		if err != nil {
-			t.Fatal(err)
-		}
-		user32.NewProc("UnregisterClassW").Call(uintptr(unsafe.Pointer(name)), uintptr(p.hinstance))
 		windows.NewLazySystemDLL("ole32.dll").NewProc("OleUninitialize").Call()
 		runtime.UnlockOSThread()
 	})
