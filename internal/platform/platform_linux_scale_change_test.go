@@ -53,7 +53,7 @@ func TestWaylandPollEvents_SteadyScaleQueuesNothing(t *testing.T) {
 // TestWaylandPrepareFrame_ScaleChangeQueuesResize covers the change PrepareFrame
 // sees first: it queues the same resize the pump would have.
 func TestWaylandPrepareFrame_ScaleChangeQueuesResize(t *testing.T) {
-	w, wp := newWaylandSecondaryPrepareFrameFixture(1024, 768, 2.0, 1.0)
+	w, wp := newWaylandPrepareFrameFixture(1024, 768, 2.0, 1.0)
 
 	callPrepareFrameWithTimeout(t, w, 2*time.Second)
 
@@ -61,8 +61,8 @@ func TestWaylandPrepareFrame_ScaleChangeQueuesResize(t *testing.T) {
 		t.Fatalf("first event = %+v, want EventScaleChanged", e)
 	}
 	resized, _ := wp.events.Pop()
-	if resized.Type != EventResize || resized.WindowID != 2 || resized.Width != 1024 || resized.Height != 768 ||
+	if resized.Type != EventResize || resized.WindowID != 1 || resized.Width != 1024 || resized.Height != 768 ||
 		resized.PhysicalWidth != 2048 || resized.PhysicalHeight != 1536 {
-		t.Errorf("second event = %+v, want EventResize of window 2 at 1024x768, 2048x1536 physical", resized)
+		t.Errorf("second event = %+v, want EventResize of window 1 at 1024x768, 2048x1536 physical", resized)
 	}
 }
