@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HostLoop.Start` brings up the adapter with no device** (@dvoyni). It brings up the platform, the instance and the
   adapter; the device comes from `HostLoop.RequestDevice`, and `HostLoop.NewWindow` fails before it.
   `Config.RequiredFeatures` and `Config.RequiredLimits` no longer apply to a `HostLoop`.
+- **Dependencies:** wgpu v0.34.9 → v0.34.13, naga v0.21.4 → v0.21.10. wgpu now accepts command buffers whose
+  resources were released after recording, the same way Rust wgpu handles a dropped handle; Vulkan descriptor pools
+  always include the dynamic buffer types; and with demote-to-helper support, a discard demotes the invocation
+  instead of emitting `OpKill`. naga adds `spirv.CapabilitySet` and fixes MSL code generation — multiple returns,
+  packed `vec3` bitcasts, atomic workgroup loads, threadgroup vector stores and the writer error paths — which
+  reaches Metal through wgpu v0.34.13; that release carries no wgpu code or API change.
 
 ### Removed
 
@@ -86,9 +92,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `app.DeviceProvider().SurfaceFormat()` → `app.GPUContextProvider().SurfaceFormat()`;
   - `WithBackend`/`Backend*` → nothing: the implementation is chosen by wgpu build tags (ADR-038);
   - `GraphicsAPI` or `GOGPU_GRAPHICS_API` selects the graphics API; `gputypes.Backends` describes the backend masks.
-- **Dependencies:** wgpu v0.34.10, naga v0.21.5. wgpu now accepts command buffers whose resources were released
-  after recording, the same way Rust wgpu handles a dropped handle, and Vulkan descriptor pools always include the
-  dynamic buffer types.
 
 ### Fixed
 
