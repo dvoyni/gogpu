@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CursorNone` hides the cursor over that window alone.
 - **Per-window focus** (@dvoyni). `Window.SetOnFocus` reports to each window its own gain and loss of keyboard focus,
   beside `App.OnFocus`, which reports every window's.
+- **Key labels and layout changes** (@dvoyni). `App.KeyLabel` answers the character the current keyboard layout
+  prints on a physical key, unshifted: 'a' for `KeyQ` on a French layout. `App.OnKeyboardLayoutChanged` reports
+  each layout change, and the layout becoming known. On Windows, X11 and Wayland; macOS and the browser answer 0.
 
 ### Performance
 
