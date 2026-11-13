@@ -1386,6 +1386,12 @@ func (w *win32Window) StartDrag(paths []string, done func(DragResult)) {
 
 func (w *win32Window) Destroy() {
 	w.destroyIMEState()
+	// The cursor mode in force is given up here: once the window leaves
+	// p.windows, the deactivation DestroyWindow sends no longer reaches
+	// applyCursorMode, and the clip, which is the whole system's, would
+	// outlive the window and the process.
+	w.active = false
+	w.applyCursorMode()
 	if w.platform != nil {
 		w.platform.windowMu.Lock()
 		delete(w.platform.windows, w.hwnd)
@@ -1586,6 +1592,12 @@ func (p *windowsPlatform) Destroy() {
 	p.windowMu.Lock()
 	toDestroy := make([]*win32Window, 0, len(p.windows))
 	for hwnd, w := range p.windows {
+		if w != nil {
+			// The cursor mode in force is given up, as win32Window.Destroy
+			// does.
+			w.active = false
+			w.applyCursorMode()
+		}
 		toDestroy = append(toDestroy, w)
 		delete(p.windows, hwnd)
 	}
